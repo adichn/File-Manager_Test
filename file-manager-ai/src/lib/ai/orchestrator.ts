@@ -1,318 +1,337 @@
 // src/lib/ai/orchestrator.ts
-// This module is server-only. Do not import it from client components.
 
-import { createClient } from '@supabase/supabase-js'
-import { ChatAnthropic } from '@langchain/anthropic'
+import { createClient } from '@supabase/supabase-js';
+import Anthropic from '@anthropic-ai/sdk';
 
-function createServiceSupabaseClient() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
-  if (!url || !serviceKey) {
-    throw new Error('Missing Supabase env vars (NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY)')
-  }
-
-  return createClient(url, serviceKey, {
-    auth: {
-      persistSession: false,
-    },
-  })
+if (!supabaseUrl || !supabaseServiceKey) {
+  throw new Error('Missing Supabase environment variables');
 }
 
-async function extractTextFromFile(blob: Blob, mimeType: string): Promise<string> {
-  if (mimeType.startsWith('text/')) {
-    return await blob.text()
-  }
+if (!anthropicApiKey) {
+  throw new Error('Missing ANTHROPIC_API_KEY');
+}
 
-  if (mimeType === 'application/pdf') {
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+const anthropic = new Anthropic({ apiKey: anthropicApiKey });
+
+interface ExtractionResult {
+  text: string;
+  method: string;
+  warnings: string[];
+}
+
+interface ClaudeContext {
+  summary: string;
+  tags: string[];
+  extra_context: {
+    document_type?: string;
+    entities?: string[];
+    date_range?: string;
+    confidence?: number;
+    [key: string]: any;
+  };
+}
+
+async function extractBestEffortText(
+  blob: Blob,
+  mimeType: string,
+  fileName: string
+): Promise<ExtractionResult> {
+  const isTextType = mimeType.startsWith('text/');
+  const textExtensions = ['.txt', '.md', '.csv', '.json', '.log'];
+  const hasTextExtension = textExtensions.some(ext => 
+    fileName.toLowerCase().endsWith(ext)
+  );
+
+  if (isTextType || hasTextExtension) {
     try {
-      // Fix: Import the module correctly
-      const pdfParse = (await import('pdf-parse')).default
-      
-      const arrayBuffer = await blob.arrayBuffer()
-      const buffer = Buffer.from(arrayBuffer)
-      const data = await pdfParse(buffer)
-      return data.text || ''
-    } catch (error) {
-      console.error('PDF extraction failed:', error)
-      throw new Error(`PDF text extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      const text = await blob.text();
+      return {
+        text,
+        method: 'blob.text',
+        warnings: []
+      };
+    } catch (err) {
+      return {
+        text: '',
+        method: 'none',
+        warnings: [`blob.text failed: ${err instanceof Error ? err.message : String(err)}`]
+      };
     }
   }
 
-  return ''
-}
-
-function chunkText(text: string, chunkSize: number = 2500): string[] {
-  const chunks: string[] = []
-  
-  for (let i = 0; i < text.length; i += chunkSize) {
-    chunks.push(text.slice(i, i + chunkSize))
-  }
-  
-  return chunks.length > 0 ? chunks : []
-}
-
-function buildSampleForContext(chunks: string[]): string {
-  if (chunks.length === 0) return ''
-  
-  if (chunks.length <= 2) {
-    return chunks.join('\n\n────────────────────────\n\n')
-  }
-
-  const first = chunks[0]
-  const middle = chunks[Math.floor(chunks.length / 2)]
-  const last = chunks[chunks.length - 1]
-
-  const sample = [
-    '=== BEGINNING OF DOCUMENT ===',
-    first,
-    '',
-    '=== MIDDLE OF DOCUMENT ===',
-    middle,
-    '',
-    '=== END OF DOCUMENT ===',
-    last,
-  ].join('\n')
-
-  const maxLength = 6000
-  return sample.length > maxLength ? sample.slice(0, maxLength) : sample
-}
-
-async function generateCompressedContextWithClaude(params: {
-  fileName: string
-  mimeType: string
-  textLength: number
-  numChunks: number
-  sample: string
-}): Promise<{
-  summary: string
-  tags: string[]
-  extraContext: Record<string, unknown>
-}> {
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY is not set')
-  }
-
-  const model = new ChatAnthropic({
-    modelName: 'claude-sonnet-4-5-20250929',
-    apiKey,
-    temperature: 0.2,
-  })
-
-  const prompt = `You are analyzing a document to create rich, searchable metadata. You are seeing SAMPLE SLICES ONLY (beginning, middle, and end) - NOT the entire document.
-
-File Information:
-- Name: ${params.fileName}
-- Type: ${params.mimeType}
-- Length: ${params.textLength} characters
-- Total chunks: ${params.numChunks}
-
-Sample Content (beginning/middle/end slices):
-${params.sample}
-
-Based on these samples, create comprehensive metadata for this document.
-
-IMPORTANT INSTRUCTIONS:
-1. The "summary" should be 3-6 sentences describing what this document is ABOUT (its purpose, topics, key information) - NOT just "a PDF titled X" or "a text file about Y". Provide actual content summary when text is available.
-2. Create 5-12 short, relevant, lowercase keyword tags using hyphens for multi-word concepts (e.g. "financial-report", "datafloat", "project-brief")
-3. Infer the document type from the list provided
-4. Extract important entities (companies, people, products, locations)
-5. Identify any date ranges or time periods mentioned
-
-You MUST output ONLY valid JSON in this EXACT format with NO preamble, NO markdown formatting, NO extra text:
-
-{
-  "summary": "A comprehensive 3-6 sentence description of what this document is about, its purpose, key topics, and context. Focus on actual content, not just metadata.",
-  "tags": ["keyword-tag-1", "keyword-tag-2", "keyword-tag-3", "keyword-tag-4", "keyword-tag-5", "etc"],
-  "extra_context": {
-    "document_type": "one of: financial_report, invoice, contract, meeting_notes, requirements_doc, slide_deck, academic_assignment, email, other",
-    "entities": ["Entity 1", "Entity 2", "Entity 3"],
-    "date_range": "e.g. 2024, 2023-2024, Jan-2025, Q3-2024, or unknown",
-    "confidence": 0.85
-  }
-}
-
-Output ONLY the JSON object, nothing else.`
-
-  const response = await model.invoke(prompt)
-  const content = response.content as string
-
-  const cleaned = content
-    .replace(/```json\n?/g, '')
-    .replace(/```\n?/g, '')
-    .trim()
-  
-  const parsed = JSON.parse(cleaned)
-
   return {
-    summary: parsed.summary || 'No summary available',
-    tags: Array.isArray(parsed.tags) ? parsed.tags : [],
-    extraContext: parsed.extra_context || {},
+    text: '',
+    method: 'none',
+    warnings: ['no_text_extracted_for_type']
+  };
+}
+
+function getFileExtension(fileName: string | undefined | null): string {
+  if (!fileName) {
+    return 'unknown';
+  }
+  const parts = fileName.split('.');
+  if (parts.length > 1) {
+    return parts[parts.length - 1].toLowerCase();
+  }
+  return 'unknown';
+}
+
+function chunkAndSample(text: string, maxSampleLength: number = 6000): string {
+  if (text.length <= maxSampleLength) {
+    return text;
+  }
+
+  const chunkSize = Math.floor(maxSampleLength / 3);
+  const start = text.slice(0, chunkSize);
+  const middleIndex = Math.floor(text.length / 2);
+  const middle = text.slice(middleIndex - Math.floor(chunkSize / 2), middleIndex + Math.floor(chunkSize / 2));
+  const end = text.slice(-chunkSize);
+
+  return `${start}\n\n[... middle section ...]\n\n${middle}\n\n[... final section ...]\n\n${end}`;
+}
+
+async function generateCompressedContext(text: string): Promise<ClaudeContext | null> {
+  try {
+    const sampledText = chunkAndSample(text, 6000);
+    
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 1500,
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'user',
+          content: `Analyze this document and return ONLY a JSON object (no commentary) with this structure:
+{
+  "summary": "a concise summary",
+  "tags": ["relevant", "tags"],
+  "extra_context": {
+    "document_type": "report|email|code|etc",
+    "entities": ["key entities mentioned"],
+    "date_range": "if applicable",
+    "confidence": 0.9
   }
 }
 
-async function upsertFileMetadata(params: {
-  supabase: ReturnType<typeof createServiceSupabaseClient>
-  fileId: string
-  userId: string
-  summary: string
-  tags: string[]
-  extraContext: Record<string, unknown>
-}): Promise<void> {
-  const { error } = await params.supabase
-    .from('file_metadata')
-    .upsert({
-      file_id: params.fileId,
-      user_id: params.userId,
-      summary: params.summary,
-      tags: params.tags,
-      extra: params.extraContext,
-      updated_at: new Date().toISOString(),
-    })
+Document content:
+${sampledText}`
+        }
+      ]
+    });
 
-  if (error) {
-    console.error('Failed to upsert file_metadata:', error)
-    throw error
+    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+    
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error('No JSON found in Claude response');
+    }
+
+    const context = JSON.parse(jsonMatch[0]) as ClaudeContext;
+    return context;
+  } catch (err) {
+    console.error('Claude context generation failed:', err);
+    return null;
   }
 }
 
-async function embedAndStoreChunks(params: {
-  supabase: ReturnType<typeof createServiceSupabaseClient>
-  fileId: string
-  userId: string
-  chunks: string[]
-}): Promise<void> {
-  console.warn('Embeddings are currently disabled; skipping embedding generation.')
+async function stubEmbeddings(fileId: string): Promise<void> {
+  console.log(`[${fileId}] Embeddings disabled — skipping.`);
 }
 
 export async function orchestrateFileIngestion(params: {
-  fileId: string
-  userId: string
+  fileId: string;
+  userId: string;
 }): Promise<void> {
-  console.log('Starting ingestion for file', params.fileId)
+  const { fileId, userId } = params;
 
-  const supabase = createServiceSupabaseClient()
+  console.log(`[${fileId}] Starting orchestration for user ${userId}`);
 
-  const { data: file, error: fileError } = await supabase
+  const { data: fileRecord, error: fileError } = await supabase
     .from('files')
     .select('*')
-    .eq('id', params.fileId)
-    .single()
+    .eq('id', fileId)
+    .eq('user_id', userId)
+    .single();
 
-  if (fileError || !file) {
-    throw new Error(`File not found: ${params.fileId}`)
+  if (fileError || !fileRecord) {
+    throw new Error(`File not found or access denied: ${fileId}`);
   }
 
-  if (file.user_id !== params.userId) {
-    throw new Error(`User ${params.userId} does not own file ${params.fileId}`)
+  const fileName = fileRecord.name || fileRecord.file_name || `file_${fileId}`;
+  const filePath = fileRecord.path || fileRecord.file_path || fileRecord.storage_path;
+  const mimeType = fileRecord.mime_type || fileRecord.type || 'application/octet-stream';
+  const sizeBytes = fileRecord.size || fileRecord.file_size || 0;
+
+  console.log(`[${fileId}] File: ${fileName}, Type: ${mimeType}, Size: ${sizeBytes} bytes`);
+
+  if (!filePath) {
+    console.error(`[${fileId}] No file path found in database record:`, fileRecord);
+    await saveFallbackMetadata(fileId, userId, fileName, mimeType, sizeBytes, {
+      error: 'no_file_path_in_database',
+      database_record: fileRecord
+    });
+    return;
   }
 
-  console.log('Processing file:', file.original_name)
-
-  const { data: fileBlob, error: downloadError } = await supabase.storage
-    .from('files')
-    .download(file.storage_path)
-
-  if (downloadError || !fileBlob) {
-    throw new Error(`Failed to download file: ${downloadError?.message}`)
-  }
-
-  let text: string
+  let blob: Blob;
   try {
-    text = await extractTextFromFile(fileBlob, file.mime_type)
-  } catch (error) {
-    console.error('Failed to extract text:', error)
-    
-    await upsertFileMetadata({
-      supabase,
-      fileId: params.fileId,
-      userId: params.userId,
-      summary: 'No textual content available or PDF text extraction failed.',
-      tags: ['no-text', 'extraction-failed'],
-      extraContext: {
-        document_type: 'unknown',
-        reason: 'text_extraction_failed',
-        mime_type: file.mime_type,
-      },
-    })
+    const { data: blobData, error: downloadError } = await supabase.storage
+      .from('files')
+      .download(filePath);
 
-    console.log('Created minimal metadata for file with extraction failure')
-    return
-  }
-
-  if (!text || text.length < 50) {
-    console.log('File has minimal or no extractable content')
-    
-    await upsertFileMetadata({
-      supabase,
-      fileId: params.fileId,
-      userId: params.userId,
-      summary: 'No textual content available or unsupported file type.',
-      tags: ['no-text', 'unsupported-type'],
-      extraContext: {
-        document_type: 'unknown',
-        reason: 'no_meaningful_content',
-        mime_type: file.mime_type,
-      },
-    })
-
-    console.log('Created minimal metadata for file with no content')
-    return
-  }
-
-  const chunks = chunkText(text)
-  console.log(`Split text into ${chunks.length} chunks`)
-
-  const sample = buildSampleForContext(chunks)
-
-  let summary: string
-  let tags: string[]
-  let extraContext: Record<string, unknown>
-
-  try {
-    console.log('Calling Claude to generate compressed context...')
-    const result = await generateCompressedContextWithClaude({
-      fileName: file.original_name,
-      mimeType: file.mime_type,
-      textLength: text.length,
-      numChunks: chunks.length,
-      sample,
-    })
-    summary = result.summary
-    tags = result.tags
-    extraContext = result.extraContext
-  } catch (error) {
-    console.error('Failed to generate context with Claude:', error)
-    summary = 'AI context not available for this file.'
-    tags = ['no-context', 'llm-error']
-    extraContext = {
-      document_type: 'unknown',
-      entities: [],
-      date_range: 'unknown',
-      confidence: 0,
-      error: 'llm_context_generation_failed',
+    if (downloadError || !blobData) {
+      throw new Error(`Failed to download file: ${downloadError?.message}`);
     }
+
+    blob = blobData;
+  } catch (err) {
+    console.error(`[${fileId}] Download failed:`, err);
+    await saveFallbackMetadata(fileId, userId, fileName, mimeType, sizeBytes, {
+      error: `download_failed: ${err instanceof Error ? err.message : String(err)}`
+    });
+    return;
   }
 
-  await upsertFileMetadata({
-    supabase,
-    fileId: params.fileId,
-    userId: params.userId,
-    summary,
-    tags,
-    extraContext,
-  })
+  const extraction = await extractBestEffortText(blob, mimeType, fileName);
+  console.log(`[${fileId}] Extraction method: ${extraction.method}, Text length: ${extraction.text.length}, Warnings: ${extraction.warnings.join(', ') || 'none'}`);
 
-  console.log('Stored compressed context in file_metadata')
+  const hasText = extraction.text.length >= 200;
 
-  await embedAndStoreChunks({
-    supabase,
-    fileId: params.fileId,
-    userId: params.userId,
-    chunks,
-  })
+  let contextGenerationStatus: 'success' | 'skipped_no_text' | 'failed' = 'skipped_no_text';
+  let claudeContext: ClaudeContext | null = null;
 
-  console.log('Embeddings disabled; skipping embedding generation')
-  console.log('✅ Finished ingestion for file', params.fileId)
+  if (hasText) {
+    console.log(`[${fileId}] Generating compressed context with Claude...`);
+    claudeContext = await generateCompressedContext(extraction.text);
+    contextGenerationStatus = claudeContext ? 'success' : 'failed';
+  } else {
+    console.log(`[${fileId}] Text too short or unavailable — skipping Claude context generation`);
+  }
+
+  let summary: string;
+  let tags: string[];
+  let extra: any;
+
+  if (claudeContext) {
+    summary = claudeContext.summary;
+    tags = claudeContext.tags;
+    extra = {
+      ...claudeContext.extra_context,
+      file_name: fileName,
+      mime_type: mimeType,
+      size_bytes: sizeBytes,
+      extraction_method: extraction.method,
+      extraction_warnings: extraction.warnings,
+      has_text: true,
+      text_length: extraction.text.length,
+      chunk_count: 1,
+      context_generation_status: contextGenerationStatus
+    };
+  } else {
+    const extension = getFileExtension(fileName);
+    summary = `File: ${fileName} (${mimeType}, ${sizeBytes} bytes). Content extraction pending.`;
+    tags = [extension, 'extraction-pending', 'no-text'];
+    extra = {
+      file_name: fileName,
+      mime_type: mimeType,
+      size_bytes: sizeBytes,
+      extraction_method: extraction.method,
+      extraction_warnings: extraction.warnings,
+      has_text: false,
+      text_length: extraction.text.length,
+      chunk_count: 0,
+      context_generation_status: contextGenerationStatus
+    };
+  }
+
+  await upsertMetadata(fileId, userId, summary, tags, extra);
+  await stubEmbeddings(fileId);
+
+  console.log(`[${fileId}] Orchestration complete`);
+}
+
+async function upsertMetadata(
+  fileId: string,
+  userId: string,
+  summary: string,
+  tags: string[],
+  extra: any
+): Promise<void> {
+  try {
+    const { data: existing } = await supabase
+      .from('file_metadata')
+      .select('id')
+      .eq('file_id', fileId)
+      .eq('user_id', userId)
+      .single();
+
+    if (existing) {
+      const { error: updateError } = await supabase
+        .from('file_metadata')
+        .update({
+          summary,
+          tags,
+          extra,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existing.id);
+
+      if (updateError) {
+        console.error(`[${fileId}] Metadata update failed:`, updateError);
+      } else {
+        console.log(`[${fileId}] Metadata updated successfully`);
+      }
+    } else {
+      const { error: insertError } = await supabase
+        .from('file_metadata')
+        .insert({
+          id: crypto.randomUUID(),
+          file_id: fileId,
+          user_id: userId,
+          summary,
+          tags,
+          extra,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+
+      if (insertError) {
+        console.error(`[${fileId}] Metadata insert failed:`, insertError);
+      } else {
+        console.log(`[${fileId}] Metadata inserted successfully`);
+      }
+    }
+  } catch (err) {
+    console.error(`[${fileId}] Metadata upsert error:`, err);
+  }
+}
+
+async function saveFallbackMetadata(
+  fileId: string,
+  userId: string,
+  fileName: string | undefined | null,
+  mimeType: string,
+  sizeBytes: number,
+  errorInfo: any
+): Promise<void> {
+  const safeFileName = fileName || `file_${fileId}`;
+  const extension = getFileExtension(fileName);
+  const summary = `File: ${safeFileName} (${mimeType}, ${sizeBytes} bytes). Processing failed.`;
+  const tags = [extension, 'processing-failed'];
+  const extra = {
+    file_name: safeFileName,
+    mime_type: mimeType,
+    size_bytes: sizeBytes,
+    has_text: false,
+    context_generation_status: 'failed',
+    ...errorInfo
+  };
+
+  await upsertMetadata(fileId, userId, summary, tags, extra);
 }
