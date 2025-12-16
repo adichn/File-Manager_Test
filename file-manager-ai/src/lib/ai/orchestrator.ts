@@ -32,8 +32,27 @@ interface ClaudeContext {
     entities?: string[];
     date_range?: string;
     confidence?: number;
-    [key: string]: any;
+    [key: string]: unknown;
   };
+}
+
+interface MetadataExtra {
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  extraction_method: string;
+  extraction_warnings: string[];
+  has_text: boolean;
+  text_length: number;
+  chunk_count: number;
+  context_generation_status: 'success' | 'skipped_no_text' | 'failed';
+  document_type?: string;
+  entities?: string[];
+  date_range?: string;
+  confidence?: number;
+  error?: string;
+  database_record?: Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 async function extractBestEffortText(
@@ -144,6 +163,154 @@ async function stubEmbeddings(fileId: string): Promise<void> {
   console.log(`[${fileId}] Embeddings disabled — skipping.`);
 }
 
+async function recomputeFolderContextIfNeeded(folderId: string, userId: string): Promise<void> {
+  try {
+    console.log(`[${folderId}] Recomputing folder context...`);
+
+    const { data: files, error: filesError } = await supabase
+      .from('files')
+      .select('id, original_name, mime_type, file_metadata(summary, tags, extra)')
+      .eq('user_id', userId)
+      .eq('folder_id', folderId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (filesError) {
+      console.error(`[${folderId}] Failed to fetch files for folder context:`, filesError);
+      return;
+    }
+
+    const fileList = files || [];
+    let summary: string;
+    let tags: string[];
+    let extraContext: Record<string, unknown>;
+
+    const fileCount = fileList.length;
+    let textFileCount = 0;
+    let pendingExtractionCount = 0;
+
+    const fileDescriptions: string[] = [];
+
+    for (const file of fileList.slice(0, 30)) {
+      const metadata = Array.isArray(file.file_metadata)
+        ? file.file_metadata[0]
+        : null;
+
+      if (metadata?.extra && typeof metadata.extra === 'object') {
+        if ((metadata.extra as Record<string, unknown>).has_text === true) {
+          textFileCount++;
+        }
+        if ((metadata.extra as Record<string, unknown>).has_text === false) {
+          pendingExtractionCount++;
+        }
+      }
+
+      const fileSummary = metadata?.summary
+        ? metadata.summary.slice(0, 200)
+        : 'No summary available';
+      const fileTags = metadata?.tags?.join(', ') || 'none';
+
+      fileDescriptions.push(
+        `File: ${file.original_name} (${file.mime_type})\nSummary: ${fileSummary}\nTags: ${fileTags}`
+      );
+    }
+
+    if (fileList.length > 0) {
+      try {
+        const prompt = `Analyze this folder containing ${fileCount} files and generate a folder-level context summary.
+
+Files in folder:
+${fileDescriptions.join('\n\n')}
+
+Return ONLY a JSON object (no commentary) with this structure:
+{
+  "summary": "3-6 sentences describing what this folder contains and its purpose",
+  "tags": ["5-15", "lowercase", "hyphenated", "tags"],
+  "extra_context": {
+    "dominant_topics": ["topic1", "topic2"],
+    "key_entities": ["entity1", "entity2"],
+    "date_range": "unknown or guessed date range",
+    "confidence": 0.85,
+    "file_count": ${fileCount},
+    "text_file_count": ${textFileCount},
+    "pending_extraction_count": ${pendingExtractionCount}
+  }
+}`;
+
+        const message = await anthropic.messages.create({
+          model: 'claude-sonnet-4-5-20250929',
+          max_tokens: 2000,
+          temperature: 0.2,
+          messages: [{ role: 'user', content: prompt }]
+        });
+
+        const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+
+        if (!jsonMatch) {
+          throw new Error('No JSON found in response');
+        }
+
+        const parsed = JSON.parse(jsonMatch[0]);
+        summary = parsed.summary;
+        tags = parsed.tags;
+        extraContext = parsed.extra_context;
+      } catch (err) {
+        console.error(`[${folderId}] Claude folder context generation failed:`, err);
+        summary = 'Folder context not available.';
+        tags = ['no-context', 'llm-error'];
+        extraContext = {
+          file_count: fileCount,
+          text_file_count: textFileCount,
+          pending_extraction_count: pendingExtractionCount,
+          error: true
+        };
+      }
+    } else {
+      summary = 'Empty folder.';
+      tags = ['empty'];
+      extraContext = {
+        file_count: 0,
+        text_file_count: 0,
+        pending_extraction_count: 0
+      };
+    }
+
+    const { data: existing } = await supabase
+      .from('folder_metadata')
+      .select('id')
+      .eq('folder_id', folderId)
+      .eq('user_id', userId)
+      .single();
+
+    if (existing) {
+      await supabase
+        .from('folder_metadata')
+        .update({
+          summary,
+          tags,
+          extra: extraContext,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existing.id);
+    } else {
+      await supabase
+        .from('folder_metadata')
+        .insert({
+          folder_id: folderId,
+          user_id: userId,
+          summary,
+          tags,
+          extra: extraContext
+        });
+    }
+
+    console.log(`[${folderId}] Folder context updated successfully`);
+  } catch (err) {
+    console.error(`[${folderId}] Failed to recompute folder context:`, err);
+  }
+}
+
 export async function orchestrateFileIngestion(params: {
   fileId: string;
   userId: string;
@@ -163,10 +330,11 @@ export async function orchestrateFileIngestion(params: {
     throw new Error(`File not found or access denied: ${fileId}`);
   }
 
-  const fileName = fileRecord.name || fileRecord.file_name || `file_${fileId}`;
-  const filePath = fileRecord.path || fileRecord.file_path || fileRecord.storage_path;
-  const mimeType = fileRecord.mime_type || fileRecord.type || 'application/octet-stream';
-  const sizeBytes = fileRecord.size || fileRecord.file_size || 0;
+  const fileName = fileRecord.original_name || `file_${fileId}`;
+  const filePath = fileRecord.storage_path;
+  const mimeType = fileRecord.mime_type || 'application/octet-stream';
+  const sizeBytes = fileRecord.size_bytes || 0;
+  const folderId = fileRecord.folder_id;
 
   console.log(`[${fileId}] File: ${fileName}, Type: ${mimeType}, Size: ${sizeBytes} bytes`);
 
@@ -174,7 +342,7 @@ export async function orchestrateFileIngestion(params: {
     console.error(`[${fileId}] No file path found in database record:`, fileRecord);
     await saveFallbackMetadata(fileId, userId, fileName, mimeType, sizeBytes, {
       error: 'no_file_path_in_database',
-      database_record: fileRecord
+      database_record: fileRecord as Record<string, unknown>
     });
     return;
   }
@@ -216,7 +384,7 @@ export async function orchestrateFileIngestion(params: {
 
   let summary: string;
   let tags: string[];
-  let extra: any;
+  let extra: MetadataExtra;
 
   if (claudeContext) {
     summary = claudeContext.summary;
@@ -253,6 +421,12 @@ export async function orchestrateFileIngestion(params: {
   await upsertMetadata(fileId, userId, summary, tags, extra);
   await stubEmbeddings(fileId);
 
+  if (folderId) {
+    recomputeFolderContextIfNeeded(folderId, userId).catch((err) => {
+      console.error(`[${fileId}] Failed to trigger folder context recomputation:`, err);
+    });
+  }
+
   console.log(`[${fileId}] Orchestration complete`);
 }
 
@@ -261,7 +435,7 @@ async function upsertMetadata(
   userId: string,
   summary: string,
   tags: string[],
-  extra: any
+  extra: MetadataExtra
 ): Promise<void> {
   try {
     const { data: existing } = await supabase
@@ -318,17 +492,21 @@ async function saveFallbackMetadata(
   fileName: string | undefined | null,
   mimeType: string,
   sizeBytes: number,
-  errorInfo: any
+  errorInfo: Partial<MetadataExtra>
 ): Promise<void> {
   const safeFileName = fileName || `file_${fileId}`;
   const extension = getFileExtension(fileName);
   const summary = `File: ${safeFileName} (${mimeType}, ${sizeBytes} bytes). Processing failed.`;
   const tags = [extension, 'processing-failed'];
-  const extra = {
+  const extra: MetadataExtra = {
     file_name: safeFileName,
     mime_type: mimeType,
     size_bytes: sizeBytes,
+    extraction_method: 'none',
+    extraction_warnings: [],
     has_text: false,
+    text_length: 0,
+    chunk_count: 0,
     context_generation_status: 'failed',
     ...errorInfo
   };

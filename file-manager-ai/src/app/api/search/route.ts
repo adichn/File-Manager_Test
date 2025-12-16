@@ -9,6 +9,7 @@ interface FileRecord {
   original_name: string;
   mime_type: string;
   created_at: string;
+  folder_id: string | null;
   file_metadata: FileMetadata[] | FileMetadata | null;
 }
 
@@ -46,13 +47,24 @@ export async function GET(request: NextRequest) {
 
   const searchParams = request.nextUrl.searchParams;
   const query = searchParams.get('q') || '';
+  const folderId = searchParams.get('folderId');
 
-  const { data: files, error: fetchError } = await supabase
+  let filesQuery = supabase
     .from('files')
-    .select('id, original_name, mime_type, created_at, file_metadata(summary, tags, extra)')
-    .eq('user_id', user.id)
-    .order('created_at', { ascending: false })
-    .limit(100);
+    .select('id, original_name, mime_type, created_at, folder_id, file_metadata(summary, tags, extra)')
+    .eq('user_id', user.id);
+
+  if (folderId) {
+    if (folderId === 'root') {
+      filesQuery = filesQuery.is('folder_id', null);
+    } else {
+      filesQuery = filesQuery.eq('folder_id', folderId);
+    }
+  }
+
+  filesQuery = filesQuery.order('created_at', { ascending: false }).limit(100);
+
+  const { data: files, error: fetchError } = await filesQuery;
 
   if (fetchError) {
     return NextResponse.json({ error: 'Failed to fetch files' }, { status: 500 });
@@ -68,6 +80,7 @@ export async function GET(request: NextRequest) {
       original_name: file.original_name,
       mime_type: file.mime_type,
       created_at: file.created_at,
+      folder_id: file.folder_id,
       summary: metadata?.summary || null,
       tags: metadata?.tags || [],
       extra: metadata?.extra || null
