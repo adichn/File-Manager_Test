@@ -159,14 +159,13 @@ ${sampledText}`
   }
 }
 
-async function stubEmbeddings(fileId: string): Promise<void> {
-  console.log(`[${fileId}] Embeddings disabled — skipping.`);
+async function stubEmbeddings(_fileId: string): Promise<void> {
+  // embeddings not yet implemented
 }
 
 async function recomputeFolderContextIfNeeded(folderId: string, userId: string): Promise<void> {
   try {
-    console.log(`[${folderId}] Recomputing folder context...`);
-
+  
     const { data: files, error: filesError } = await supabase
       .from('files')
       .select('id, original_name, mime_type, file_metadata(summary, tags, extra)')
@@ -305,7 +304,6 @@ Return ONLY a JSON object (no commentary) with this structure:
         });
     }
 
-    console.log(`[${folderId}] Folder context updated successfully`);
   } catch (err) {
     console.error(`[${folderId}] Failed to recompute folder context:`, err);
   }
@@ -317,7 +315,6 @@ export async function orchestrateFileIngestion(params: {
 }): Promise<void> {
   const { fileId, userId } = params;
 
-  console.log(`[${fileId}] Starting orchestration for user ${userId}`);
 
   const { data: fileRecord, error: fileError } = await supabase
     .from('files')
@@ -336,7 +333,6 @@ export async function orchestrateFileIngestion(params: {
   const sizeBytes = fileRecord.size_bytes || 0;
   const folderId = fileRecord.folder_id;
 
-  console.log(`[${fileId}] File: ${fileName}, Type: ${mimeType}, Size: ${sizeBytes} bytes`);
 
   if (!filePath) {
     console.error(`[${fileId}] No file path found in database record:`, fileRecord);
@@ -367,7 +363,6 @@ export async function orchestrateFileIngestion(params: {
   }
 
   const extraction = await extractBestEffortText(blob, mimeType, fileName);
-  console.log(`[${fileId}] Extraction method: ${extraction.method}, Text length: ${extraction.text.length}, Warnings: ${extraction.warnings.join(', ') || 'none'}`);
 
   const hasText = extraction.text.length >= 200;
 
@@ -375,11 +370,8 @@ export async function orchestrateFileIngestion(params: {
   let claudeContext: ClaudeContext | null = null;
 
   if (hasText) {
-    console.log(`[${fileId}] Generating compressed context with Claude...`);
     claudeContext = await generateCompressedContext(extraction.text);
     contextGenerationStatus = claudeContext ? 'success' : 'failed';
-  } else {
-    console.log(`[${fileId}] Text too short or unavailable — skipping Claude context generation`);
   }
 
   let summary: string;
@@ -427,7 +419,6 @@ export async function orchestrateFileIngestion(params: {
     });
   }
 
-  console.log(`[${fileId}] Orchestration complete`);
 }
 
 async function upsertMetadata(
@@ -458,8 +449,6 @@ async function upsertMetadata(
 
       if (updateError) {
         console.error(`[${fileId}] Metadata update failed:`, updateError);
-      } else {
-        console.log(`[${fileId}] Metadata updated successfully`);
       }
     } else {
       const { error: insertError } = await supabase
@@ -477,8 +466,6 @@ async function upsertMetadata(
 
       if (insertError) {
         console.error(`[${fileId}] Metadata insert failed:`, insertError);
-      } else {
-        console.log(`[${fileId}] Metadata inserted successfully`);
       }
     }
   } catch (err) {
